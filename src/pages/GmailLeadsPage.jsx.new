@@ -1,0 +1,459 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  Container, Typography, CircularProgress, Alert, Box, Paper, Table, TableBody, 
+  TableCell, TableContainer, TableHead, TableRow, Button, IconButton, 
+  Dialog, DialogTitle, DialogContent, DialogActions, Avatar, Divider
+} from '@mui/material';
+import { 
+  Refresh as RefreshIcon, 
+  Save as SaveIcon, 
+  Visibility as ViewIcon, 
+  Logout as LogoutIcon, 
+  Login as LoginIcon, 
+  Person as PersonIcon 
+} from '@mui/icons-material';
+import { GOOGLE_CLIENT_ID, GMAIL_SCOPES, INCLUSION_KEYWORDS } from '../config/gmail';
+import { parseEmailHeaders, formatDate } from '../utils/gmailUtils';
+import { useLeads } from '../context/LeadsContext';
+
+// Load Google Identity Services script
+const loadGoogleIdentityServices = () => {
+  return new Promise((resolve) => {
+    if (window.google?.accounts) {
+      return resolve(true);
+    }
+    
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve(!!window.google?.accounts);
+    script.onerror = () => {
+      console.error('Failed to load Google Identity Services');
+      resolve(false);
+    };
+    document.head.appendChild(script);
+  });
+};
+
+// Fetch user info using Google's userinfo endpoint
+const fetchUserInfo = async (accessToken) => {
+  try {
+    const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+    
+    if (!response.ok) throw new Error('Failed to fetch user info');
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching user info:', error);
+    return null;
+  }
+};
+
+// Error Boundary Component
+class ErrorBoundary extends React.Component {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('Error caught by ErrorBoundary:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Box p={3}>
+          <Typography variant="h6" color="error" gutterBottom>
+            Something went wrong
+          </Typography>
+          <Typography variant="body1" paragraph>
+            {this.state.error?.message || 'An unexpected error occurred'}
+          </Typography>
+          <Button 
+            variant="contained" 
+            color="primary"
+            onClick={() => window.location.reload()}
+          >
+            Reload Page
+          </Button>
+        </Box>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const GmailLeadsPage = () => {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [emails, setEmails] = useState([]);
+  const [selectedEmail, setSelectedEmail] = useState(null);
+  const [token, setToken] = useState(localStorage.getItem('gmail_token') || '');
+  const [user, setUser] = useState({ 
+    email: localStorage.getItem('gmail_user_email') || '',
+    name: localStorage.getItem('gmail_user_name') || 'User',
+    imageUrl: localStorage.getItem('gmail_user_photo') || ''
+  });
+  
+  const { addLead } = useLeads();
+  const clientRef = useRef();
+  
+  // Initialize Google Identity Services
+  useEffect(() => {
+    const initializeGoogleAuth = async () => {
+      try {
+        const loaded = await loadGoogleIdentityServices();
+        if (!loaded) {
+          setError('Failed to load Google Identity Services. Please check your network and reload the page.');
+          console.error('[Google Script] Failed to load Google Identity Services.');
+          return;
+        }
+        
+        clientRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: import.meta.env.GOOGLE_CLIENT_ID,
+          scope: import.meta.env.GMAIL_SCOPES.split(',').join(' '),
+          callback: async (response) => {
+            console.log('[OAuth Callback] Response:', response);
+            if (response.error) {
+              setError(response.error);
+              console.error('[OAuth Callback] Error in response:', response.error);
+              return;
+            }
+            
+            const accessToken = response.access_token;
+            console.log('[OAuth Callback] Received access token:', accessToken);
+            setToken(accessToken);
+            localStorage.setItem('gmail_token', accessToken);
+            
+            // Fetch user info
+            const userInfo = await fetchUserInfo(accessToken);
+            console.log('[OAuth Callback] User info:', userInfo);
+            if (userInfo) {
+              setUser({
+                email: userInfo.email,
+                name: userInfo.name || userInfo.email.split('@')[0],
+                imageUrl: userInfo.picture || ''
+              });
+              localStorage.setItem('gmail_user_email', userInfo.email);
+              localStorage.setItem('gmail_user_name', userInfo.name || userInfo.email.split('@')[0]);
+              localStorage.setItem('gmail_user_photo', userInfo.picture || '');
+              
+              // Fetch emails after successful login
+              fetchEmails(accessToken);
+              // Redirect to /gmail-leads if not already there
+              if (window.location.pathname !== '/gmail-leads') {
+                console.log('[OAuth Callback] Redirecting to /gmail-leads');
+                window.location.href = '/gmail-leads';
+              }
+            }
+          },
+          error_callback: (error) => {
+            console.error('[OAuth Callback] Google OAuth error:', error);
+            setError('Failed to sign in with Google. See console for details.');
+          }
+        });
+      } catch (err) {
+        console.error('Error initializing Google Auth:', err);
+        setError('Failed to initialize Google authentication');
+      }
+    };
+
+    initializeGoogleAuth();
+  }, []);
+  
+  // Fetch emails from Gmail API
+  const fetchEmails = useCallback(async (accessToken) => {
+    if (!accessToken) return;
+    
+    setLoading(true);
+    setError('');
+    
+    try {
+      // Build the query to search for potential leads
+      const query = [
+        ...INCLUSION_KEYWORDS.map(k => `(${k})`),
+        'in:inbox',
+        'is:unread'
+      ].join(' ');
+      
+      // First, search for messages
+      const response = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error('Failed to fetch emails');
+      }
+      
+      const data = await response.json();
+      setEmails(data.messages || []);
+    } catch (err) {
+      console.error('Error fetching emails:', err);
+      setError('Failed to fetch emails. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  
+  // Handle sign in
+  const handleSignIn = useCallback(() => {
+    console.log('[SignIn] Button clicked. clientRef.current:', clientRef.current);
+    if (clientRef.current) {
+      try {
+        clientRef.current.requestAccessToken();
+        console.log('[SignIn] requestAccessToken() called.');
+      } catch (err) {
+        console.error('[SignIn] Error calling requestAccessToken:', err);
+        setError('Google sign-in failed. See console for details.');
+      }
+    } else {
+      console.error('[SignIn] Google OAuth client is not initialized (clientRef.current is null).');
+      setError('Google sign-in is not ready. Please wait for the page to finish loading.');
+    }
+  }, []);
+  
+  // Handle sign out
+  const handleSignOut = useCallback(() => {
+    // Revoke the token
+    if (token && window.google?.accounts?.oauth2) {
+      window.google.accounts.oauth2.revoke(token, () => {
+        // Clear state and storage
+        setUser({ email: '', name: 'User', imageUrl: '' });
+        setToken('');
+        setEmails([]);
+        localStorage.removeItem('gmail_token');
+        localStorage.removeItem('gmail_user_email');
+        localStorage.removeItem('gmail_user_name');
+        localStorage.removeItem('gmail_user_photo');
+      });
+    }
+  }, [token]);
+  
+  // Handle saving an email as a lead
+  const handleSaveAsLead = useCallback((email) => {
+    if (!email) return;
+    
+    const newLead = {
+      id: email.id,
+      name: email.from.split('<')[0].trim(),
+      email: email.from.match(/<([^>]+)>/)?.[1] || email.from,
+      phone: '',
+      source: 'Gmail',
+      status: 'New Lead',
+      notes: email.snippet,
+      createdAt: new Date().toISOString()
+    };
+    
+    addLead(newLead);
+  }, [addLead]);
+  
+  // Handle viewing email details
+  const handleViewEmail = useCallback((email) => {
+    setSelectedEmail(email);
+  }, []);
+  
+  // Handle closing the email dialog
+  const handleCloseEmailDialog = useCallback(() => {
+    setSelectedEmail(null);
+  }, []);
+  
+  return (
+    <ErrorBoundary>
+      <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+          <Typography variant="h4" component="h1">
+            Gmail Leads
+          </Typography>
+          
+          {token ? (
+            <Box display="flex" alignItems="center" gap={2}>
+              {user.imageUrl ? (
+                <Avatar src={user.imageUrl} alt={user.name} />
+              ) : (
+                <Avatar>
+                  <PersonIcon />
+                </Avatar>
+              )}
+              <Typography variant="subtitle1">
+                {user.name}
+              </Typography>
+              <Button
+                variant="outlined"
+                color="secondary"
+                startIcon={<LogoutIcon />}
+                onClick={handleSignOut}
+              >
+                Sign Out
+              </Button>
+            </Box>
+          ) : (
+            <Button
+              variant="contained"
+              color="primary"
+              startIcon={<LoginIcon />}
+              onClick={handleSignIn}
+              disabled={loading}
+            >
+              Sign In with Google
+            </Button>
+          )}
+        </Box>
+        
+        {error && (
+          <Alert severity="error" sx={{ mb: 3 }}>
+            {error}
+          </Alert>
+        )}
+        
+        {loading ? (
+          <Box display="flex" justifyContent="center" my={4}>
+            <CircularProgress />
+          </Box>
+        ) : token ? (
+          <Paper sx={{ width: '100%', overflow: 'hidden' }}>
+            <TableContainer sx={{ maxHeight: '70vh' }}>
+              <Table stickyHeader size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>From</TableCell>
+                    <TableCell>Subject</TableCell>
+                    <TableCell>Date</TableCell>
+                    <TableCell>Actions</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {emails.length > 0 ? (
+                    emails.map((email) => (
+                      <TableRow key={email.id} hover>
+                        <TableCell>{email.from}</TableCell>
+                        <TableCell>{email.subject}</TableCell>
+                        <TableCell>{formatDate(email.date)}</TableCell>
+                        <TableCell>
+                          <IconButton 
+                            size="small" 
+                            onClick={() => handleViewEmail(email)}
+                            title="View Email"
+                          >
+                            <ViewIcon />
+                          </IconButton>
+                          <IconButton 
+                            size="small" 
+                            onClick={() => handleSaveAsLead(email)}
+                            title="Save as Lead"
+                          >
+                            <SaveIcon />
+                          </IconButton>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  ) : (
+                    <TableRow>
+                      <TableCell colSpan={4} align="center">
+                        No emails found. Try refreshing or check your search criteria.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            
+            <Box p={2} display="flex" justifyContent="flex-end">
+              <Button
+                variant="outlined"
+                startIcon={<RefreshIcon />}
+                onClick={() => fetchEmails(token)}
+                disabled={loading}
+              >
+                Refresh
+              </Button>
+            </Box>
+          </Paper>
+        ) : (
+          <Box 
+            display="flex" 
+            flexDirection="column" 
+            alignItems="center" 
+            justifyContent="center" 
+            minHeight="50vh"
+            textAlign="center"
+          >
+            <Typography variant="h6" gutterBottom>
+              Sign in with Google to view your Gmail leads
+            </Typography>
+            <Button
+              variant="contained"
+              color="primary"
+              size="large"
+              startIcon={<LoginIcon />}
+              onClick={handleSignIn}
+              sx={{ mt: 2 }}
+            >
+              Sign In with Google
+            </Button>
+          </Box>
+        )}
+        
+        {/* Email Details Dialog */}
+        <Dialog 
+          open={!!selectedEmail} 
+          onClose={handleCloseEmailDialog}
+          maxWidth="md"
+          fullWidth
+        >
+          <DialogTitle>
+            {selectedEmail?.subject || 'Email Details'}
+          </DialogTitle>
+          <DialogContent dividers>
+            <Box mb={2}>
+              <Typography variant="subtitle2" color="textSecondary">From:</Typography>
+              <Typography>{selectedEmail?.from}</Typography>
+            </Box>
+            <Box mb={2}>
+              <Typography variant="subtitle2" color="textSecondary">To:</Typography>
+              <Typography>{selectedEmail?.to}</Typography>
+            </Box>
+            <Box mb={2}>
+              <Typography variant="subtitle2" color="textSecondary">Date:</Typography>
+              <Typography>{selectedEmail?.date ? formatDate(selectedEmail.date) : ''}</Typography>
+            </Box>
+            <Divider sx={{ my: 2 }} />
+            <Box>
+              <Typography variant="subtitle2" color="textSecondary" gutterBottom>
+                Message:
+              </Typography>
+              <Typography whiteSpace="pre-line">
+                {selectedEmail?.snippet || 'No content available'}
+              </Typography>
+            </Box>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={handleCloseEmailDialog}>Close</Button>
+            <Button 
+              variant="contained" 
+              color="primary"
+              startIcon={<SaveIcon />}
+              onClick={() => {
+                handleSaveAsLead(selectedEmail);
+                handleCloseEmailDialog();
+              }}
+            >
+              Save as Lead
+            </Button>
+          </DialogActions>
+        </Dialog>
+      </Container>
+    </ErrorBoundary>
+  );
+};
+
+export default GmailLeadsPage;
